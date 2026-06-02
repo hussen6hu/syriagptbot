@@ -1,4 +1,4 @@
-const T='8363241044:AAHNENSFHQ_81qXmOj3u2pMfkjyUNhmwjFo',K='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',A=`https://api.telegram.org/bot${T}`;
+const T='8363241044:AAHNENSFHQ_81qXmOj3u2pMfkjyUNhmwjFo',K='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',A=`https://api.telegram.org/bot${T}`;
 async function s(c,t){await fetch(`${A}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:c,text:t,parse_mode:'HTML'})})}
 Bun.serve({port:process.env.PORT||3000,async fetch(r){const u=new URL(r.url);
 if(u.pathname==='/')await fetch(`${A}/setWebhook?url=https://syriagptbot.onrender.com`).catch(()=>{});
