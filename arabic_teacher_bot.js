@@ -1,397 +1,446 @@
-// ============================================
-// مدرس اللغة العربية - بوت إعراب تيليغرام
-// Telegram Bot: @ArabicTeacher1Bot
-// ============================================
-
-const TELEGRAM_TOKEN = '8939193095:AAHgd-tLExPzfCJYWHAxki-dbons3rnvjPc';
-const OPENROUTER_KEY = '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';
-const API_BASE = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
-
-// Admin user ID (you - hussen)
-const ADMIN_ID = 5513754275;
-
-// Sham Cash account (you set this)
-const SHAM_CASH_PHONE = 'd90f5c756d29a33a645cf1c3a2a0cd1f';
-
-// Price in SYP
-const SUBSCRIPTION_PRICE_SYP = 60000; // ~$5
-
-// Free trial requests
-const FREE_TRIAL_LIMIT = 3;
-
-// ===== User Storage (JSON file) =====
-const fetch = require('node-fetch');
 const fs = require('fs');
-const DB_PATH = './users_db.json';
+const path = require('path');
+const http = require('http');
+const fetch = require('node-fetch');
+const crypto = require('crypto');
 
-function loadDB() {
+// ======= الإعدادات =======
+const TELEGRAM_TOKEN = '8939193095:AAHgd-tLExPzfCJYWHAxki-dbons3rnvjPc';
+const SHAM_CASH_PHONE = 'd90f5c756d29a33a645cf1c3a2a0cd1f';
+const SUBSCRIPTION_PRICE_LIRA = 100; // 100 ل.س (عملة سورية جديدة) ≈ 5$
+const TRIAL_COUNT = 3;
+const ADMIN_USER_ID = 5513754275;
+
+const OPENROUTER_API_KEY = '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';
+
+const DB_PATH = './users_db.json';
+const BOT_USERNAME = 'ArabicTeacher1Bot';
+
+// ======= قاعدة البيانات =======
+let usersDB = {};
+if (fs.existsSync(DB_PATH)) {
   try {
-    return JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
-  } catch {
-    return {};
-  }
+    usersDB = JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+  } catch(e) { usersDB = {}; }
 }
 
-function saveDB(db) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
+function saveDB() {
+  fs.writeFileSync(DB_PATH, JSON.stringify(usersDB, null, 2));
 }
 
 function getUser(userId) {
-  const db = loadDB();
-  if (!db[userId]) {
-    db[userId] = {
+  if (!usersDB[userId]) {
+    usersDB[userId] = {
       id: userId,
-      subscribed: false,
-      expiry: null,
-      freeUsed: 0,
-      pendingPayment: false,
-      subsActivated: 0
+      trialCount: 0,
+      subscriptionEnd: null,
+      registeredAt: new Date().toISOString()
     };
-    saveDB(db);
+    saveDB();
   }
-  return db[userId];
+  return usersDB[userId];
 }
 
-function updateUser(userId, data) {
-  const db = loadDB();
-  db[userId] = { ...db[userId], ...data };
-  saveDB(db);
+function canUse(userId) {
+  if (Number(userId) === ADMIN_USER_ID) return true;
+  const u = getUser(userId);
+  if (u.subscriptionEnd && new Date(u.subscriptionEnd) > new Date()) return true;
+  if (u.trialCount < TRIAL_COUNT) return true;
+  return false;
 }
 
-// ===== Helpers =====
-async function sendMsg(chatId, text, parseMode = 'HTML', replyMarkup = null) {
-  const payload = { chat_id: chatId, text, parse_mode: parseMode };
-  if (replyMarkup) payload.reply_markup = replyMarkup;
-  await fetch(`${API_BASE}/sendMessage`, {
+function useCredit(userId) {
+  if (Number(userId) === ADMIN_USER_ID) return true;
+  const u = getUser(userId);
+  if (u.subscriptionEnd && new Date(u.subscriptionEnd) > new Date()) return true;
+  if (u.trialCount < TRIAL_COUNT) {
+    u.trialCount++;
+    saveDB();
+    return true;
+  }
+  return false;
+}
+
+function activateSubscription(userId, days = 30) {
+  const u = getUser(userId);
+  const now = new Date();
+  const end = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
+  u.subscriptionEnd = end.toISOString();
+  saveDB();
+  return end;
+}
+
+// ======= OpenRouter API =======
+async function askAI(prompt) {
+  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
+    headers: {
+      'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+      'Content-Type': 'application/json',
+      'HTTP-Referer': 'https://t.me/ArabicTeacher1Bot',
+    },
+    body: JSON.stringify({
+      model: 'google/gemini-2.0-flash-exp:free',
+      messages: [
+        { role: 'system', content: 'أنت معلم لغة عربية خبير. مهمتك إعراب الجمل العربية إعراباً كاملاً. أعرِب كل كلمة في الجملة مع ذكر نوع الكلمة وعلامة الإعراب. كن دقيقاً ومفصلاً.' },
+        { role: 'user', content: prompt }
+      ],
+      max_tokens: 1000,
+    })
   });
+  const data = await response.json();
+  if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+  return data.choices[0].message.content;
 }
 
-function isSubscribed(userId) {
-  const user = getUser(userId);
-  if (!user.subscribed || !user.expiry) return false;
-  return new Date(user.expiry) > new Date();
+// ======= دوال البوت =======
+function sendMessage(chatId, text, opts = {}) {
+  const params = new URLSearchParams();
+  params.append('chat_id', chatId);
+  params.append('text', text);
+  params.append('parse_mode', 'HTML');
+  if (opts.replyMarkup) params.append('reply_markup', JSON.stringify(opts.replyMarkup));
+  if (opts.replyTo) params.append('reply_to_message_id', opts.replyTo);
+  return fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params
+  }).then(r => r.json());
 }
 
-function getExpiryDate() {
-  const d = new Date();
-  d.setDate(d.getDate() + 30);
-  return d.toISOString();
+function sendPhoto(chatId, photo, caption) {
+  // Not implemented for simplicity - send as text instead
+  return sendMessage(chatId, caption || '📸 صورة الإيصال');
 }
 
-// ===== AI إعراب Function =====
-async function getIrab(text) {
-  const systemPrompt = `أنت أستاذ متخصص في اللغة العربية والإعراب.
-مهمتك: إعراب الجمل العربية إعراباً دقيقاً كاملاً.
-- اذكر نوع الجملة أولاً (اسمية / فعلية)
-- أعرب كل كلمة إعراباً مفصلاً
-- اشرح القواعد النحوية المطبقة إن لزم
-- استخدم لغة عربية فصيحة واضحة
-- إذا كان النص غير عربي أو غير مفهوم، قل: "يرجى إرسال جملة عربية صحيحة"
-- لا تخرج عن موضوع الإعراب`;
-  
+function answerCallback(queryId, text) {
+  const params = new URLSearchParams();
+  params.append('callback_query_id', queryId);
+  params.append('text', text || 'تم');
+  return fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/answerCallbackQuery`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params
+  }).then(r => r.json());
+}
+
+function editMessageText(chatId, msgId, text, markup) {
+  const params = new URLSearchParams();
+  params.append('chat_id', chatId);
+  params.append('message_id', msgId);
+  params.append('text', text);
+  params.append('parse_mode', 'HTML');
+  if (markup) params.append('reply_markup', JSON.stringify(markup));
+  return fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params
+  }).then(r => r.json());
+}
+
+// ======= معالجة الأوامر =======
+async function handleUpdate(update) {
   try {
-    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${OPENROUTER_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'openai/gpt-4o-mini',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: `أعرب الجملة التالية إعراباً كاملاً: ${text}` }
-        ]
-      })
-    });
-    const data = await res.json();
-    return data.choices?.[0]?.message?.content || '⚠️ حدث خطأ في الاستجابة، حاول مرة أخرى.';
-  } catch (e) {
-    return '⚠️ عذراً، تعذر الاتصال بخدمة الإعراب. حاول لاحقاً.';
-  }
-}
+    // رسالة نصية
+    if (update.message) {
+      const msg = update.message;
+      const chatId = msg.chat.id;
+      const userId = msg.from.id;
+      const text = (msg.text || '').trim();
+      const entities = msg.entities || [];
 
-// ===== Admin Keyboard =====
-function adminKeyboard() {
-  return {
-    inline_keyboard: [
-      [{ text: '👥 عرض جميع المشتركين', callback_data: 'admin_list' }],
-      [{ text: '📊 الإحصائيات', callback_data: 'admin_stats' }]
-    ]
-  };
-}
+      getUser(userId);
 
-function userKeyboard(isSubd) {
-  if (isSubd) {
-    return {
-      inline_keyboard: [
-        [{ text: '📝 أرسل جملة للإعراب', callback_data: 'send_irab' }],
-        [{ text: '📅 اشتراكي', callback_data: 'my_sub' }]
-      ]
-    };
-  }
-  return {
-    inline_keyboard: [
-      [{ text: '💳 الاشتراك - 60,000 ل.س شهرياً', callback_data: 'subscribe' }],
-      [{ text: '🎁 جرب مجاناً (3 إعرابات)', callback_data: 'free_trial' }]
-    ]
-  };
-}
+      // أمر /start
+      if (text === '/start') {
+        const u = getUser(userId);
+        let statusText = '';
+        if (Number(userId) === ADMIN_USER_ID) {
+          statusText = '👑 أنت مشرف البوت — إعراب غير محدود';
+        } else if (u.subscriptionEnd && new Date(u.subscriptionEnd) > new Date()) {
+          statusText = `✅ اشتراكك مفعل حتى ${new Date(u.subscriptionEnd).toLocaleDateString('ar-IQ')}`;
+        } else {
+          statusText = `💚 متبقي لك ${TRIAL_COUNT - u.trialCount} إعرابات مجانية`;
+        }
 
-// ===== Main Handler =====
-async function handleMessage(msg) {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const text = msg.text?.trim();
-  const isAdmin = userId === ADMIN_ID;
+        const welcome = `👋 مرحباً بك في بوت <b>مدرس اللغة العربية</b>! 🎓
 
-  if (!text) {
-    // Handle photo (payment receipt)
-    if (msg.photo) {
-      const user = getUser(userId);
-      if (user.pendingPayment) {
-        const photoId = msg.photo[msg.photo.length - 1].file_id;
-        
-        const adminMsg = `📌 <b>طلب اشتراك جديد</b>\n`
-          + `👤 المستخدم: ${msg.from.first_name || ''} ${msg.from.last_name || ''}\n`
-          + `🆔 ID: <code>${userId}</code>\n`
-          + `📅 التاريخ: ${new Date().toLocaleString('ar-SA')}\n`
-          + `📸 أرسل صورة الإيصال أعلاه`;
-        
-        await fetch(`${API_BASE}/sendPhoto`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: ADMIN_ID,
-            photo: photoId,
-            caption: adminMsg,
-            reply_markup: {
-              inline_keyboard: [[
-                { text: '✅ تفعيل الاشتراك', callback_data: `activate_${userId}` }
-              ]]
-            }
-          })
-        });
-        
-        await sendMsg(chatId, '✅ استلمنا إيصالك! سيقوم المشرف بتأكيد الاشتراك قريباً.');
-        updateUser(userId, { pendingPayment: false });
-        return;
+📌 أرسل لي أي جملة عربية وسأقوم بإعرابها كلمة كلمة.
+
+${statusText}
+
+💰 الاشتراك الشهري: ${SUBSCRIPTION_PRICE_LIRA.toLocaleString()} ل.س (إعراب غير محدود لمدة 30 يوماً)
+📲 للاشتراك: أرسل /subscribe`;
+
+        const keyboard = {
+          inline_keyboard: [
+            [{ text: '💚 تجربة إعراب', callback_data: 'try' }],
+            [{ text: '💰 اشتراك شهري', callback_data: 'subscribe' }],
+            [{ text: '📊 حسابي', callback_data: 'status' }]
+          ]
+        };
+        if (Number(userId) === ADMIN_USER_ID) {
+          keyboard.inline_keyboard.push([{ text: '⚙️ لوحة المشرف', callback_data: 'admin' }]);
+        }
+        return sendMessage(chatId, welcome, { replyMarkup: keyboard });
       }
-    }
-    return;
-  }
 
-  const user = getUser(userId);
+      // أمر /subscribe
+      if (text === '/subscribe') {
+        return subscribeFlow(chatId, userId);
+      }
 
-  // ===== COMMANDS =====
-  if (text === '/start') {
-    let welcome = `👨‍🏫 <b>مرحباً بك في مدرس اللغة العربية!</b>\n\n`
-      + `🤖 بوت متخصص في <b>إعراب الجمل العربية</b>\n`
-      + `📚 نحو، بلاغة، إعراب كامل ومفصل\n\n`;
-    
-    if (isSubscribed(userId)) {
-      welcome += `✅ اشتراكك مفعل حتى: ${new Date(user.expiry).toLocaleDateString('ar-SA')}`;
-    } else {
-      welcome += `🎁 لديك <b>${FREE_TRIAL_LIMIT - user.freeUsed}</b> إعراب مجاني متبقي\n`
-        + `💳 اشتراك شهري: <b>${SUBSCRIPTION_PRICE_SYP.toLocaleString()} ل.س</b> (~5$)\n`
-        + `♾️ إعراب غير محدود طوال الشهر`;
-    }
-    
-    await sendMsg(chatId, welcome);
-    const kb = isSubscribed(userId) ? userKeyboard(true) : userKeyboard(false);
-    await sendMsg(chatId, '🔽 اختر أحد الخيارات:', 'HTML', kb);
-    return;
-  }
+      // أمر /confirm
+      if (text === '/confirm') {
+        return sendMessage(chatId, `📸 أرسل صورة إيصال تحويل ${SUBSCRIPTION_PRICE_LIRA.toLocaleString()} ل.س إلى رقم شام كاش:\n\n<b>${SHAM_CASH_PHONE}</b>\n\nبعد إرسال الصورة، سيقوم المشرف بتفعيل اشتراكك.`);
+      }
 
-  if (text === '/subscribe') {
-    if (isSubscribed(userId)) {
-      await sendMsg(chatId, `✅ اشتراكك مفعل حتى ${new Date(user.expiry).toLocaleDateString('ar-SA')}`);
-      return;
-    }
-    
-    const subMsg = `💳 <b>الاشتراك في البوت</b>\n\n`
-      + `📌 المبلغ: <b>${SUBSCRIPTION_PRICE_SYP.toLocaleString()} ل.س</b> (شهرياً)\n`
-      + `📲 ادفع عبر <b>شام كاش</b>\n`
-      + `📱 رقم المحفظة: <b>${SHAM_CASH_PHONE}</b>\n\n`
-      + `بعد الدفع، أرسل <b>/confirm</b> مع صورة الإيصال\n`
-      + `📌 سيتم تفعيل اشتراكك بعد التأكيد`;
-    
-    await sendMsg(chatId, subMsg);
-    return;
-  }
+      // أمر /status
+      if (text === '/status') {
+        return showStatus(chatId, userId);
+      }
 
-  if (text === '/confirm') {
-    await sendMsg(chatId, '📸 أرسل صورة إيصال التحويل من شام كاش');
-    updateUser(userId, { pendingPayment: true });
-    return;
-  }
+      // أمر /admin
+      if (text === '/admin' && Number(userId) === ADMIN_USER_ID) {
+        return adminPanel(chatId);
+      }
 
-  // ===== Admin commands =====
-  if (isAdmin && text === '/stats') {
-    const db = loadDB();
-    const total = Object.keys(db).length;
-    const active = Object.values(db).filter(u => u.subscribed && u.expiry && new Date(u.expiry) > new Date()).length;
-    await sendMsg(chatId, `📊 <b>إحصائيات البوت</b>\n👥 إجمالي المستخدمين: ${total}\n✅ المشتركين النشطين: ${active}`);
-    return;
-  }
+      // إذا كانت صورة
+      if (msg.photo) {
+        // صورة إيصال — إرسالها للمشرف
+        const caption = msg.caption || '';
+        if (caption.toLowerCase().includes('شام') || caption.toLowerCase().includes('confirm')) {
+          // أرسل للمشرف
+          const photoData = msg.photo[msg.photo.length - 1];
+          const adminKeyboard = {
+            inline_keyboard: [[
+              { text: '✅ تفعيل الاشتراك', callback_data: `activate_${userId}` }
+            ]]
+          };
+          await sendMessage(ADMIN_USER_ID, 
+            `📸 <b>طلب اشتراك جديد</b>\n👤 المستخدم: ${userId}\n🏷️ ${msg.from.first_name || ''} ${msg.from.last_name || ''}\n💳 المبلغ: ${SUBSCRIPTION_PRICE_LIRA.toLocaleString()} ل.س`,
+            { replyMarkup: adminKeyboard }
+          );
+          return sendMessage(chatId, '✅ تم إرسال طلب الاشتراك للمشرف. سيتم تفعيله قريباً.');
+        }
+        return sendMessage(chatId, '⚠️ أرسل الجملة التي تريد إعرابها.');
+      }
 
-  // ===== Handle normal text =====
-  if (text.startsWith('/')) return;
+      // نص عادي — إعراب
+      if (text && !text.startsWith('/')) {
+        if (!canUse(userId)) {
+          const kb = { inline_keyboard: [[{ text: '💰 اشتراك شهري', callback_data: 'subscribe' }]] };
+          return sendMessage(chatId, `⚠️ انتهت الإعرابات المجانية.\n\nاشترك الآن: /subscribe`, { replyMarkup: kb });
+        }
 
-  // Check subscription or free trial
-  const subd = isSubscribed(userId);
-  
-  if (!subd) {
-    if (user.freeUsed >= FREE_TRIAL_LIMIT) {
-      await sendMsg(chatId, `❌ انتهت الإعرابات المجانية!\n\n💳 اشترك الآن:\n<b>${SUBSCRIPTION_PRICE_SYP.toLocaleString()} ل.س</b> شهرياً عبر شام كاش\n\nأرسل /subscribe للمزيد`);
-      return;
-    }
-    updateUser(userId, { freeUsed: user.freeUsed + 1 });
-    await sendMsg(chatId, `🎁 إعراب مجاني (${user.freeUsed}/${FREE_TRIAL_LIMIT})`);
-  } else {
-    await sendMsg(chatId, '⏳ جاري الإعراب...');
-  }
-
-  // Get the إعراب
-  const irab = await getIrab(text);
-  await sendMsg(chatId, `📝 <b>الإعراب:</b>\n\n${irab}`);
-}
-
-// ===== Callback Query Handler =====
-async function handleCallback(query) {
-  const chatId = query.message.chat.id;
-  const userId = query.from.id;
-  const data = query.data;
-
-  await fetch(`${API_BASE}/answerCallbackQuery`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ callback_query_id: query.id })
-  });
-
-  if (data === 'subscribe') {
-    if (isSubscribed(userId)) {
-      await sendMsg(chatId, `✅ اشتراكك مفعل حتى ${new Date(getUser(userId).expiry).toLocaleDateString('ar-SA')}`);
-      return;
-    }
-    const subMsg = `💳 <b>الاشتراك في البوت</b>\n\n`
-      + `📌 المبلغ: <b>${SUBSCRIPTION_PRICE_SYP.toLocaleString()} ل.س</b>\n`
-      + `📲 ادفع عبر <b>شام كاش</b>\n`
-      + `📱 رقم المحفظة: <b>${SHAM_CASH_PHONE}</b>\n\n`
-      + `بعد الدفع، أرسل <b>/confirm</b> مع صورة الإيصال`;
-    await sendMsg(chatId, subMsg);
-    return;
-  }
-
-  if (data === 'free_trial') {
-    const user = getUser(userId);
-    const remaining = FREE_TRIAL_LIMIT - user.freeUsed;
-    if (remaining <= 0) {
-      await sendMsg(chatId, '❌ انتهت الإعرابات المجانية. اشترك عبر /subscribe');
-      return;
-    }
-    await sendMsg(chatId, `🎁 لديك ${remaining} إعرابات مجانية متبقية. أرسل أي جملة عربية وسأعربها لك!`);
-    return;
-  }
-
-  if (data === 'my_sub') {
-    if (isSubscribed(userId)) {
-      await sendMsg(chatId, `✅ اشتراكك مفعل حتى: ${new Date(getUser(userId).expiry).toLocaleDateString('ar-SA')}`);
-    } else {
-      await sendMsg(chatId, '❌ ليس لديك اشتراك نشط. أرسل /subscribe');
-    }
-    return;
-  }
-
-  if (data === 'send_irab') {
-    await sendMsg(chatId, '✍️ أرسل الجملة التي تريد إعرابها');
-    return;
-  }
-
-  // Admin: activate subscription
-  if (data.startsWith('activate_') && userId === ADMIN_ID) {
-    const targetId = data.replace('activate_', '');
-    const expiry = getExpiryDate();
-    const targetUser = getUser(targetId);
-    updateUser(targetId, { subscribed: true, expiry, subsActivated: (targetUser.subsActivated || 0) + 1 });
-    
-    await sendMsg(chatId, `✅ تم تفعيل الاشتراك للمستخدم <code>${targetId}</code> حتى ${new Date(expiry).toLocaleDateString('ar-SA')}`);
-    await sendMsg(parseInt(targetId), `✅ <b>تم تفعيل اشتراكك!</b>\n\n♾️ إعراب غير محدود حتى ${new Date(expiry).toLocaleDateString('ar-SA')}\n📝 أرسل أي جملة عربية وسأعربها لك فوراً!`);
-    return;
-  }
-
-  if (data === 'admin_list' && userId === ADMIN_ID) {
-    const db = loadDB();
-    let list = '👥 <b>جميع المستخدمين:</b>\n\n';
-    Object.values(db).forEach(u => {
-      const active = u.subscribed && u.expiry && new Date(u.expiry) > new Date();
-      list += `🆔 <code>${u.id}</code> | ${active ? '✅ مفعل' : '❌ غير مفعل'} | مجاني: ${u.freeUsed}/3\n`;
-    });
-    await sendMsg(chatId, list || 'لا يوجد مستخدمين بعد');
-    return;
-  }
-
-  if (data === 'admin_stats' && userId === ADMIN_ID) {
-    const db = loadDB();
-    const total = Object.keys(db).length;
-    const active = Object.values(db).filter(u => u.subscribed && u.expiry && new Date(u.expiry) > new Date()).length;
-    const totalSubs = Object.values(db).reduce((sum, u) => sum + (u.subsActivated || 0), 0);
-    await sendMsg(chatId, `📊 <b>إحصائيات البوت</b>\n👥 إجمالي المستخدمين: ${total}\n✅ المشتركين النشطين: ${active}\n📈 إجمالي الاشتراكات المفعّلة: ${totalSubs}`);
-    return;
-  }
-}
-
-// ===== Polling mode (getUpdates) =====
-let offset = 0;
-
-async function pollUpdates() {
-  try {
-    const res = await fetch(`${API_BASE}/getUpdates?offset=${offset}&timeout=30`);
-    const data = await res.json();
-    
-    if (data.ok && data.result) {
-      for (const update of data.result) {
-        offset = update.update_id + 1;
-        
+        const loading = await sendMessage(chatId, '🔍 جاري إعراب الجملة...');
         try {
-          if (update.callback_query) {
-            await handleCallback(update.callback_query);
-          } else if (update.message) {
-            await handleMessage(update.message);
-          }
-        } catch (e) {
-          console.error('Error handling update:', e.message);
+          const answer = await askAI(`أعرِب هذه الجملة إعراباً كاملاً:\n"${text}"`);
+          useCredit(userId);
+          
+          // حذف رسالة التحميل
+          try {
+            await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/deleteMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ chat_id: chatId, message_id: loading.result.message_id })
+            });
+          } catch(e) {}
+
+          const u = getUser(userId);
+          let footer = '';
+          if (Number(userId) === ADMIN_USER_ID) footer = '\n\n👑 مشرف';
+          else if (u.subscriptionEnd && new Date(u.subscriptionEnd) > new Date()) footer = `\n\n📅 اشتراك ساري حتى ${new Date(u.subscriptionEnd).toLocaleDateString('ar-IQ')}`;
+          else footer = `\n\n💚 متبقي ${TRIAL_COUNT - u.trialCount} إعرابات مجانية`;
+
+          return sendMessage(chatId, `📖 <b>الإعراب:</b>\n\n${answer}${footer}`);
+        } catch (err) {
+          try {
+            await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/deleteMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ chat_id: chatId, message_id: loading.result.message_id })
+            });
+          } catch(e) {}
+          return sendMessage(chatId, `❌ خطأ: ${err.message}\nيرجى المحاولة لاحقاً.`);
         }
       }
     }
-  } catch (e) {
-    console.error('Polling error:', e.message);
+
+    // Callback query
+    if (update.callback_query) {
+      const cb = update.callback_query;
+      const chatId = cb.message.chat.id;
+      const userId = cb.from.id;
+      const msgId = cb.message.message_id;
+      const data = cb.data;
+
+      await answerCallback(cb.id);
+
+      if (data === 'try') {
+        return sendMessage(chatId, '📝 أرسل لي جملة عربية وسأقوم بإعرابها فوراً.');
+      }
+
+      if (data === 'subscribe') {
+        return subscribeFlow(chatId, userId);
+      }
+
+      if (data === 'status') {
+        return showStatus(chatId, userId);
+      }
+
+      if (data === 'admin' && Number(userId) === ADMIN_USER_ID) {
+        return adminPanel(chatId);
+      }
+
+      if (data.startsWith('activate_')) {
+        if (Number(userId) !== ADMIN_USER_ID) {
+          return sendMessage(chatId, '⚠️ فقط المشرف يمكنه التفعيل.');
+        }
+        const targetUserId = data.replace('activate_', '');
+        const end = activateSubscription(targetUserId);
+        await editMessageText(chatId, msgId, 
+          `✅ <b>تم تفعيل الاشتراك</b>\n👤 المستخدم: ${targetUserId}\n📅 ساري حتى: ${end.toLocaleDateString('ar-IQ')}\n🎉 تم منح 30 يوماً من الإعراب غير المحدود.`,
+          { inline_keyboard: [] }
+        );
+        // أبلغ المستخدم
+        await sendMessage(targetUserId, `🎉 <b>تم تفعيل اشتراكك!</b>\n\nالآن يمكنك إرسال جمل للإعراب بدون حدود لمدة 30 يوماً.\n\n📅 ينتهي في: ${end.toLocaleDateString('ar-IQ')}`);
+        return;
+      }
+
+      if (data.startsWith('deactivate_')) {
+        if (Number(userId) !== ADMIN_USER_ID) return;
+        const targetUserId = data.replace('deactivate_', '');
+        const u = getUser(targetUserId);
+        u.subscriptionEnd = null;
+        saveDB();
+        await editMessageText(chatId, msgId, 
+          `✅ تم إلغاء اشتراك المستخدم ${targetUserId}`,
+          { inline_keyboard: [] }
+        );
+        return;
+      }
+
+      if (data === 'list_users') {
+        if (Number(userId) !== ADMIN_USER_ID) return;
+        const userIds = Object.keys(usersDB);
+        let msg = `👥 <b>جميع المستخدمين (${userIds.length})</b>\n\n`;
+        const activeUsers = userIds.filter(id => {
+          const u = usersDB[id];
+          return u.subscriptionEnd && new Date(u.subscriptionEnd) > new Date();
+        });
+        msg += `✅ اشتراك نشط: ${activeUsers.length}\n`;
+        msg += `💚 تجربة فقط: ${userIds.length - activeUsers.length}\n\n`;
+        activeUsers.slice(0, 20).forEach(id => {
+          const u = usersDB[id];
+          msg += `👤 ${id} — حتى ${new Date(u.subscriptionEnd).toLocaleDateString('ar-IQ')}\n`;
+        });
+        return sendMessage(chatId, msg);
+      }
+    }
+
+  } catch (err) {
+    console.error('Error handling update:', err);
   }
-  
+}
+
+// ======= دوال مساعدة =======
+async function subscribeFlow(chatId, userId) {
+  const u = getUser(userId);
+  if (u.subscriptionEnd && new Date(u.subscriptionEnd) > new Date()) {
+    return sendMessage(chatId, `✅ اشتراكك مفعل حتى ${new Date(u.subscriptionEnd).toLocaleDateString('ar-IQ')}.`);
+  }
+
+  const msg = `💰 <b>اشتراك مدرس اللغة العربية</b>
+
+📌 اشتراك شهري: ${SUBSCRIPTION_PRICE_LIRA.toLocaleString()} ل.س
+🎯 إعراب غير محدود لمدة 30 يوماً
+
+📲 <b>للدفع عبر شام كاش:</b>
+حول المبلغ إلى الرقم التالي:
+<b>${SHAM_CASH_PHONE}</b>
+
+بعد التحويل، أرسل /confirm ثم ارفع صورة الإيصال.`;
+
+  const keyboard = {
+    inline_keyboard: [[
+      { text: '📸 إرسال الإيصال', callback_data: 'try' }
+    ]]
+  };
+  return sendMessage(chatId, msg, { replyMarkup: keyboard });
+}
+
+async function showStatus(chatId, userId) {
+  const u = getUser(userId);
+  let msg = '';
+  if (Number(userId) === ADMIN_USER_ID) {
+    msg = `👑 <b>أنت المشرف</b>\n\nلديك إعراب غير محدود 🌟`;
+  } else if (u.subscriptionEnd && new Date(u.subscriptionEnd) > new Date()) {
+    const remaining = Math.ceil((new Date(u.subscriptionEnd) - new Date()) / (1000*60*60*24));
+    msg = `✅ <b>اشتراكك نشط</b>\n📅 ينتهي بعد ${remaining} يوم\n📆 ${new Date(u.subscriptionEnd).toLocaleDateString('ar-IQ')}`;
+  } else {
+    msg = `💚 <b>حساب تجريبي</b>\n📊 استخدمت ${u.trialCount} من ${TRIAL_COUNT} إعرابات مجانية`;
+    if (u.trialCount >= TRIAL_COUNT) {
+      msg += '\n\n⚠️ انتهت الإعرابات المجانية.\nاشترك الآن: /subscribe';
+    }
+  }
+  return sendMessage(chatId, msg);
+}
+
+async function adminPanel(chatId) {
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: '👥 عرض المستخدمين', callback_data: 'list_users' }],
+      [{ text: '📊 إحصائيات', callback_data: 'admin' }]
+    ]
+  };
+  return sendMessage(chatId, `⚙️ <b>لوحة المشرف</b>\n\nاختر أحد الخيارات:`, { replyMarkup: keyboard });
+}
+
+// ======= HTTP server for Render =======
+const PORT = process.env.PORT || 10000;
+const server = http.createServer((req, res) => {
+  if (req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(`<h1>🤖 مدرس اللغة العربية</h1><p>البوت شغال ✅</p><p>@ArabicTeacher1Bot</p>`);
+  } else {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try {
+        const update = JSON.parse(body);
+        handleUpdate(update);
+      } catch(e) {}
+      res.writeHead(200);
+      res.end('OK');
+    });
+  }
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Bot: @${BOT_USERNAME}`);
+});
+
+// ======= Polling: سحب التحديثات =======
+let lastOffset = 0;
+async function pollUpdates() {
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates?offset=${lastOffset + 1}&timeout=30`);
+    const data = await res.json();
+    if (data.ok && data.result) {
+      for (const update of data.result) {
+        lastOffset = update.update_id;
+        handleUpdate(update).catch(err => console.error('Update error:', err));
+      }
+    }
+  } catch (err) {
+    console.error('Polling error:', err.message);
+  }
   setTimeout(pollUpdates, 1000);
 }
 
-// ===== HTTP Server for Render keep-alive =====
-const http = require('http');
-const PORT = process.env.PORT || 10000;
+// بدء السحب
+pollUpdates();
 
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-  const db = loadDB();
-  const totalUsers = Object.keys(db).length;
-  const activeSubs = Object.values(db).filter(u => u.subscribed && u.expiry && new Date(u.expiry) > new Date()).length;
-  res.end(`<h1>👨‍🏫 مدرس اللغة العربية</h1>
-<p>✅ البوت شغال!</p>
-<p>👥 المستخدمين: ${totalUsers}</p>
-<p>✅ المشتركين النشطين: ${activeSubs}</p>
-<p>📅 ${new Date().toLocaleString('ar-SA')}</p>`);
-});
-
-server.listen(PORT, () => {
-  console.log(`🤖 مدرس اللغة العربية bot running on port ${PORT}`);
-  // Start polling
-  pollUpdates();
-});
+console.log(`🤖 Bot @${BOT_USERNAME} started with polling mode...`);
