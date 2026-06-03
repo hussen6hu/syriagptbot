@@ -1,7 +1,12 @@
 {
-  "name": "syria-gpt-bot",
+  "name": "arabic-teacher-bot",
   "version": "1.0.0",
-  "type": "module",
-  "scripts": { "start": "bun run index.js" },
-  "dependencies": {}
+  "description": "مدرس اللغة العربية - بوت إعراب تيليغرام",
+  "main": "arabic_teacher_bot.js",
+  "scripts": {
+    "start": "node arabic_teacher_bot.js"
+  },
+  "dependencies": {
+    "node-fetch": "^2.7.0"
+  }
 }
